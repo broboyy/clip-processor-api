@@ -1,95 +1,51 @@
 import os
-import json
 import uuid
 import subprocess
-import threading
-import time
-from flask import Flask, request, jsonify
-import yt_dlp
-from faster_whisper import WhisperModel
-import cv2
-import mediapipe as mp
+import requests
+from flask import Flask, request, jsonify, send_file
 
 app = Flask(__name__)
-
 TEMP_DIR = "/tmp/clips"
 os.makedirs(TEMP_DIR, exist_ok=True)
 
-# ─── HELPER: Download YouTube video ───────────────────────────────────────────
+
+# ── Download YouTube video ─────────────────────────────────────────────────────
 def download_youtube(url, output_path):
-    ydl_opts = {
-        "format": "bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/best[height<=720][ext=mp4]/best[height<=720]",
-        "outtmpl": output_path,
-        "merge_output_format": "mp4",
-        "quiet": True,
-    }
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        ydl.download([url])
+    subprocess.run([
+        "yt-dlp",
+        "-f", "bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/best[height<=720]/best",
+        "--merge-output-format", "mp4",
+        "-o", output_path,
+        "--quiet",
+        url
+    ], check=True)
 
 
-# ─── HELPER: Get video duration ───────────────────────────────────────────────
-def get_duration(path):
-    result = subprocess.run(
-        ["ffprobe", "-v", "error", "-show_entries", "format=duration",
-         "-of", "default=noprint_wrappers=1:nokey=1", path],
-        capture_output=True, text=True
-    )
-    return float(result.stdout.strip())
+# ── Get video info via ffprobe ─────────────────────────────────────────────────
+def get_video_info(path):
+    result = subprocess.run([
+        "ffprobe", "-v", "error",
+        "-select_streams", "v:0",
+        "-show_entries", "stream=width,height,duration",
+        "-of", "csv=p=0", path
+    ], capture_output=True, text=True)
+    parts = result.stdout.strip().split(",")
+    w = int(parts[0]) if len(parts) > 0 else 1280
+    h = int(parts[1]) if len(parts) > 1 else 720
+    dur = float(parts[2]) if len(parts) > 2 else 60
+    return w, h, dur
 
 
-# ─── HELPER: Transcribe with Whisper ──────────────────────────────────────────
-def transcribe_video(video_path):
-    model = WhisperModel("tiny", device="cpu", compute_type="int8")
-    segments_gen, _ = model.transcribe(video_path, language="id")
-    segments_list = [{"start": s.start, "end": s.end, "text": s.text} for s in segments_gen]
-    result = {"segments": segments_list}
-    return result
-
-
-# ─── HELPER: Detect face position for crop center ─────────────────────────────
-def detect_face_center(video_path, timestamp_sec):
-    mp_face = mp.solutions.face_detection
-    cap = cv2.VideoCapture(video_path)
-    fps = cap.get(cv2.CAP_PROP_FPS)
-    frame_num = int(timestamp_sec * fps)
-    cap.set(cv2.CAP_PROP_POS_FRAMES, frame_num)
-    ret, frame = cap.read()
-    cap.release()
-
-    if not ret:
-        return 0.5  # default center
-
-    h, w = frame.shape[:2]
-    with mp_face.FaceDetection(min_detection_confidence=0.5) as face_detection:
-        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        results = face_detection.process(rgb)
-        if results.detections:
-            bbox = results.detections[0].location_data.relative_bounding_box
-            face_cx = bbox.xmin + bbox.width / 2
-            return max(0.1, min(0.9, face_cx))
-    return 0.5
-
-
-# ─── HELPER: Crop video to 9:16 with face tracking ───────────────────────────
-def crop_to_916(input_path, output_path, start, end, face_x_ratio=0.5):
-    probe = subprocess.run(
-        ["ffprobe", "-v", "error", "-select_streams", "v:0",
-         "-show_entries", "stream=width,height",
-         "-of", "csv=p=0", input_path],
-        capture_output=True, text=True
-    )
-    w, h = map(int, probe.stdout.strip().split(","))
-
+# ── Crop video to 9:16 center ──────────────────────────────────────────────────
+def crop_to_916(input_path, output_path, start, end):
+    w, h, _ = get_video_info(input_path)
     target_w = int(h * 9 / 16)
     if target_w > w:
         target_w = w
-
-    cx = int(face_x_ratio * w)
-    x_offset = cx - target_w // 2
-    x_offset = max(0, min(x_offset, w - target_w))
-
+    x_offset = (w - target_w) // 2
     duration = end - start
-    cmd = [
+
+    subprocess.run([
         "ffmpeg", "-y",
         "-ss", str(start),
         "-i", input_path,
@@ -98,11 +54,56 @@ def crop_to_916(input_path, output_path, start, end, face_x_ratio=0.5):
         "-c:v", "libx264", "-crf", "23", "-preset", "fast",
         "-c:a", "aac", "-b:a", "128k",
         output_path
-    ]
-    subprocess.run(cmd, capture_output=True)
+    ], capture_output=True, check=True)
 
 
-# ─── HELPER: Generate SRT subtitle ────────────────────────────────────────────
+# ── Transcribe via Gemini API ──────────────────────────────────────────────────
+def transcribe_with_gemini(video_path, gemini_key):
+    # Upload file ke Gemini Files API
+    with open(video_path, "rb") as f:
+        video_data = f.read()
+
+    # Step 1: Upload
+    upload_resp = requests.post(
+        f"https://generativelanguage.googleapis.com/upload/v1beta/files?key={gemini_key}",
+        headers={"Content-Type": "video/mp4"},
+        data=video_data,
+        timeout=120
+    )
+    if upload_resp.status_code != 200:
+        return []
+
+    file_uri = upload_resp.json().get("file", {}).get("uri", "")
+    if not file_uri:
+        return []
+
+    # Step 2: Transcribe
+    resp = requests.post(
+        f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={gemini_key}",
+        json={
+            "contents": [{
+                "parts": [
+                    {"file_data": {"mime_type": "video/mp4", "file_uri": file_uri}},
+                    {"text": "Transkripsi video ini ke bahasa Indonesia. Balas HANYA JSON array berikut tanpa markdown:\n[{\"start\":0.0,\"end\":3.0,\"text\":\"teks subtitle\"}]\nTimestamp dalam detik, setiap segment max 7 kata."}
+                ]
+            }],
+            "generationConfig": {"temperature": 0.1, "maxOutputTokens": 4000}
+        },
+        timeout=120
+    )
+
+    if resp.status_code != 200:
+        return []
+
+    raw = resp.json().get("candidates", [{}])[0].get("content", {}).get("parts", [{}])[0].get("text", "")
+    raw = raw.replace("```json", "").replace("```", "").strip()
+    try:
+        return eval(raw) if raw.startswith("[") else []
+    except:
+        return []
+
+
+# ── Generate SRT subtitle ──────────────────────────────────────────────────────
 def generate_srt(segments, start_offset, end_offset, srt_path):
     def fmt(t):
         t = max(0, t)
@@ -115,13 +116,13 @@ def generate_srt(segments, start_offset, end_offset, srt_path):
     lines = []
     idx = 1
     for seg in segments:
-        s_start = seg["start"]
-        s_end = seg["end"]
+        s_start = float(seg.get("start", 0))
+        s_end = float(seg.get("end", 0))
         if s_end < start_offset or s_start > end_offset:
             continue
         adj_start = max(0, s_start - start_offset)
         adj_end = min(end_offset - start_offset, s_end - start_offset)
-        text = seg["text"].strip()
+        text = seg.get("text", "").strip()
         if not text:
             continue
         lines.append(f"{idx}\n{fmt(adj_start)} --> {fmt(adj_end)}\n{text}\n")
@@ -130,31 +131,33 @@ def generate_srt(segments, start_offset, end_offset, srt_path):
     with open(srt_path, "w", encoding="utf-8") as f:
         f.write("\n".join(lines))
 
+    return idx > 1
 
-# ─── HELPER: Burn subtitle into video ─────────────────────────────────────────
+
+# ── Burn subtitle ──────────────────────────────────────────────────────────────
 def burn_subtitle(input_path, srt_path, output_path):
-    cmd = [
+    subprocess.run([
         "ffmpeg", "-y",
         "-i", input_path,
         "-vf", (
             f"subtitles={srt_path}:force_style='"
-            "FontName=Arial,FontSize=14,PrimaryColour=&HFFFFFF,OutlineColour=&H000000,"
-            "Outline=2,Shadow=1,Alignment=2,MarginV=40'"
+            "FontName=Arial,FontSize=14,PrimaryColour=&HFFFFFF,"
+            "OutlineColour=&H000000,Outline=2,Shadow=1,Alignment=2,MarginV=40'"
         ),
         "-c:v", "libx264", "-crf", "23", "-preset", "fast",
         "-c:a", "copy",
         output_path
-    ]
-    subprocess.run(cmd, capture_output=True)
+    ], capture_output=True)
 
 
-# ─── MAIN ENDPOINT ────────────────────────────────────────────────────────────
+# ── MAIN ENDPOINT ──────────────────────────────────────────────────────────────
 @app.route("/process", methods=["POST"])
 def process_video():
     data = request.get_json()
     youtube_url = data.get("url")
     num_clips = int(data.get("num_clips", 3))
-    timestamps = data.get("timestamps", [])  # dari Gemini: [{start, end, reason}]
+    timestamps = data.get("timestamps", [])
+    gemini_key = data.get("gemini_key", "")
 
     if not youtube_url:
         return jsonify({"error": "url required"}), 400
@@ -164,46 +167,48 @@ def process_video():
     os.makedirs(job_dir, exist_ok=True)
 
     try:
-        # 1. Download video
+        # 1. Download
         raw_path = os.path.join(job_dir, "source.mp4")
         download_youtube(youtube_url, raw_path)
 
-        # 2. Transcribe
-        transcript = transcribe_video(raw_path)
-        segments = transcript.get("segments", [])
-
-        # 3. Jika timestamps tidak dikirim, bagi rata sebagai fallback
+        # 2. Fallback timestamps jika tidak ada
         if not timestamps:
-            duration = get_duration(raw_path)
-            clip_duration = min(60, duration / num_clips)
+            _, _, duration = get_video_info(raw_path)
+            clip_dur = min(60, duration / max(num_clips, 1))
             timestamps = [
-                {"start": i * clip_duration, "end": (i + 1) * clip_duration, "reason": "auto"}
+                {"start": i * clip_dur, "end": (i + 1) * clip_dur, "reason": f"Segment {i+1}"}
                 for i in range(num_clips)
             ]
 
         timestamps = timestamps[:num_clips]
+
+        # 3. Transcribe via Gemini (jika ada key)
+        segments = []
+        if gemini_key:
+            segments = transcribe_with_gemini(raw_path, gemini_key)
 
         # 4. Proses setiap clip
         clip_paths = []
         for i, ts in enumerate(timestamps):
             start = float(ts["start"])
             end = float(ts["end"])
-            mid = (start + end) / 2
-
-            # Deteksi wajah
-            face_x = detect_face_center(raw_path, mid)
 
             # Crop 9:16
             cropped = os.path.join(job_dir, f"clip_{i}_cropped.mp4")
-            crop_to_916(raw_path, cropped, start, end, face_x)
+            crop_to_916(raw_path, cropped, start, end)
 
-            # Buat subtitle
-            srt_path = os.path.join(job_dir, f"clip_{i}.srt")
-            generate_srt(segments, start, end, srt_path)
-
-            # Burn subtitle
             final_path = os.path.join(job_dir, f"clip_{i}_final.mp4")
-            burn_subtitle(cropped, srt_path, final_path)
+
+            # Subtitle jika ada transcript
+            if segments:
+                srt_path = os.path.join(job_dir, f"clip_{i}.srt")
+                has_subs = generate_srt(segments, start, end, srt_path)
+                if has_subs:
+                    burn_subtitle(cropped, srt_path, final_path)
+                else:
+                    os.rename(cropped, final_path)
+            else:
+                os.rename(cropped, final_path)
 
             clip_paths.append({
                 "index": i + 1,
@@ -213,27 +218,21 @@ def process_video():
                 "reason": ts.get("reason", "")
             })
 
-        # 5. Return paths
-        return jsonify({
-            "job_id": job_id,
-            "clips": clip_paths,
-            "status": "success"
-        })
+        return jsonify({"job_id": job_id, "clips": clip_paths, "status": "success"})
 
     except Exception as e:
         return jsonify({"error": str(e), "status": "failed"}), 500
 
 
-@app.route("/file/<job_id>/<filename>", methods=["GET"])
+@app.route("/file/<job_id>/<filename>")
 def get_file(job_id, filename):
-    from flask import send_file
     path = os.path.join(TEMP_DIR, job_id, filename)
     if os.path.exists(path):
         return send_file(path, mimetype="video/mp4")
     return jsonify({"error": "file not found"}), 404
 
 
-@app.route("/health", methods=["GET"])
+@app.route("/health")
 def health():
     return jsonify({"status": "ok"})
 
