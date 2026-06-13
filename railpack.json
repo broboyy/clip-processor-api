@@ -1,12 +1,9 @@
 {
   "provider": "python",
-  "python": {
-    "version": "3.11.9"
-  },
   "packages": {
-    "ffmpeg": "latest",
-    "pkg-config": "latest"
+    "ffmpeg": "latest"
   },
+  "aptPackages": ["pkg-config", "libavformat-dev", "libavcodec-dev", "libavutil-dev", "libavfilter-dev", "libswscale-dev", "libswresample-dev"],
   "install": {
     "cmds": [
       "pip install --upgrade pip setuptools wheel",
