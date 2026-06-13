@@ -3,10 +3,8 @@
   "packages": {
     "ffmpeg": "latest"
   },
-  "aptPackages": ["pkg-config", "libavformat-dev", "libavcodec-dev", "libavutil-dev", "libavfilter-dev", "libswscale-dev", "libswresample-dev"],
   "install": {
     "cmds": [
-      "pip install --upgrade pip setuptools wheel",
       "pip install -r requirements.txt"
     ]
   },
