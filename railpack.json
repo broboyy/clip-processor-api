@@ -3,7 +3,9 @@
   "python": {
     "version": "3.11.9"
   },
-  "packages": ["ffmpeg"],
+  "packages": {
+    "ffmpeg": "latest"
+  },
   "install": {
     "cmds": [
       "pip install --upgrade pip setuptools wheel",
