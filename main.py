@@ -6,7 +6,7 @@ import threading
 import time
 from flask import Flask, request, jsonify
 import yt_dlp
-import whisper
+from faster_whisper import WhisperModel
 import cv2
 import mediapipe as mp
 
@@ -39,8 +39,10 @@ def get_duration(path):
 
 # ─── HELPER: Transcribe with Whisper ──────────────────────────────────────────
 def transcribe_video(video_path):
-    model = whisper.load_model("tiny")
-    result = model.transcribe(video_path, language="id", task="transcribe")
+    model = WhisperModel("tiny", device="cpu", compute_type="int8")
+    segments_gen, _ = model.transcribe(video_path, language="id")
+    segments_list = [{"start": s.start, "end": s.end, "text": s.text} for s in segments_gen]
+    result = {"segments": segments_list}
     return result
 
 
