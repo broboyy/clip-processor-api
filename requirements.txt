@@ -1,6 +1,7 @@
 flask==3.0.3
 yt-dlp==2024.8.6
-openai-whisper==20231117
+openai-whisper==20240930
 mediapipe==0.10.14
 opencv-python-headless==4.10.0.84
 gunicorn==22.0.0
+setuptools>=68.0.0
