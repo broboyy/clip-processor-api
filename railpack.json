@@ -4,7 +4,8 @@
     "version": "3.11.9"
   },
   "packages": {
-    "ffmpeg": "latest"
+    "ffmpeg": "latest",
+    "pkg-config": "latest"
   },
   "install": {
     "cmds": [
