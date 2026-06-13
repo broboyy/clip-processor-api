@@ -1,8 +1,4 @@
 flask==3.0.3
 yt-dlp==2024.8.6
-faster-whisper==1.0.3
-av==16.1.0
-mediapipe==0.10.33
-opencv-python-headless==4.10.0.84
+requests==2.31.0
 gunicorn==22.0.0
-setuptools>=68.0.0
